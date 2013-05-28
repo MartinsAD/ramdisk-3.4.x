@@ -1,0 +1,147 @@
+#!/android/recovery/sbin/sh
+# Uniboot kernel: script for booting the same kernel
+# into the installed android version
+# Author: nobodyAtall @ xda
+# You are not allowed to use this script without explicit permission
+# Version 0.3
+
+mk_devices() {
+	mkdir -p /sys /tmp /proc /data /dev /system/bin /cache
+	mount -t sysfs sysfs /sys
+	mount -t proc proc /proc
+	mkdir /dev/input /dev/graphics /dev/block /dev/log
+	mknod -m 666 /dev/null c 1 3
+	mknod -m 666 /dev/graphics/fb0 c 29 0
+	mknod -m 666 /dev/tty0 c 4 0
+	mknod -m 600 /dev/block/mmcblk0 b 179 0
+	mknod -m 666 /dev/log/system c 10 17
+	mknod -m 666 /dev/log/radio c 10 18
+	mknod -m 666 /dev/log/events c 10 19
+	mknod -m 666 /dev/log/main c 10 20
+	mknod -m 666 /dev/ashmem c 10 21
+	mknod -m 666 /dev/urandom c 1 9
+	for i in 0 1 2 3 4 5 6 7 8 9
+	do
+		num=`expr 64 + $i`
+		mknod -m 600 /dev/input/event${i} c 13 $num
+	done
+	MTDCACHE=`cat /proc/mtd | grep cache | awk -F ':' {'print $1'} | sed 's/mtd//'`
+	MTDSYSTEM=`cat /proc/mtd | grep system | awk -F ':' {'print $1'} | sed 's/mtd//'`
+	mknod -m 600 /dev/block/mtdblock${MTDCACHE} b 31 $MTDCACHE
+	mknod -m 600 /dev/block/mtdblock${MTDSYSTEM} b 31 $MTDSYSTEM
+}
+
+cleanup() {
+	umount /system
+	umount /cache
+	umount /sys
+	umount /proc
+	rm -rf /dev/input /dev/graphics /dev/block /dev/tty0 /dev/log /dev/ashmem /dev/urandom
+	rm -rf /android /modules
+}
+
+recovery() {
+	echo 'RECOVERY BOOT' >> /boot.txt
+	rm -rf /cache/recovery/boot
+	echo 0 > ${BOOTREC_LED_RED}
+	echo 0 > ${BOOTREC_LED_GREEN}
+	echo 255 > ${BOOTREC_LED_BLUE}
+	echo 0 > ${BOOTREC_LED_BUTTONS}
+	echo 0 > /sys/module/msm_fb/parameters/align_buffer
+	mv android/recovery/* / 2>&1
+	sleep 4
+	cleanup
+	echo -ne '\n' | exec /init
+}
+
+
+copy_modules() {
+	mkdir -p /system/lib/modules/
+	for x in `ls /modules/`
+	do
+		MD5SUM1=`md5sum /modules/$x | awk {'print $1'}`
+		MD5SUM2=`md5sum /system/lib/modules/$x | awk {'print $1'}`
+		if [ "$MD5SUM1" != "$MD5SUM2" ]
+		then
+			mv /modules/$x /system/lib/modules/$x
+		fi
+	done
+}
+
+android() {
+	echo 'ANDROID BOOT' >>boot.txt
+	echo 0 > ${BOOTREC_LED_RED}
+	echo 0 > ${BOOTREC_LED_GREEN}
+	echo 0 > ${BOOTREC_LED_BLUE}
+	echo 0 > ${BOOTREC_LED_BUTTONS}
+	echo 1 > /sys/module/msm_fb/parameters/align_buffer
+	cd /android; mkdir ${version}.ramdisk; cd ${version}.ramdisk; cat ../$version | cpio -i
+	cd /
+	mv android/${version}.ramdisk/* /
+	if [ "$version" == "4.2" ] 
+	then
+		insmod /modules/bluedroid.ko &
+	fi
+	copy_modules
+	echo 1 > /sys/devices/virtual/android_usb/android0/enable
+	date >>boot.txt	
+	rm -rf /res
+	cleanup
+	echo -ne '\n' | exec /init
+}
+
+set +x
+_PATH="$PATH"
+export PATH=/android/recovery/sbin:/sbin
+BOOTREC_LED_RED="/sys/class/leds/red/brightness"
+BOOTREC_LED_GREEN="/sys/class/leds/green/brightness"
+BOOTREC_LED_BLUE="/sys/class/leds/blue/brightness"
+BOOTREC_LED_BUTTONS="/sys/class/leds/button-backlight/brightness"
+cd /
+date >>boot.txt
+exec >>boot.txt 2>&1
+mount -o remount,rw rootfs /
+mk_devices
+
+startup=`cat /proc/cmdline | tr ' ' '\n' | grep startup | awk -F '=' {'print $2'}`
+keypad_input=''
+for input in `ls -d /sys/class/input/input*`
+do
+	type=`cat ${input}/name`
+	case "$type" in
+    (*keypad*) keypad_input=`echo $input | sed 's/^.*input//'`;;
+    (*)        ;;
+    esac
+done
+
+# trigger amber LED & button-backlight
+echo 255 > ${BOOTREC_LED_RED}
+echo 0 > ${BOOTREC_LED_GREEN}
+echo 255 > ${BOOTREC_LED_BLUE}
+echo 255 > ${BOOTREC_LED_BUTTONS}
+
+cat /dev/input/event${keypad_input} > /dev/keycheck&
+echo $! > /dev/keycheck.pid
+sleep 3
+
+mount -t yaffs2 /dev/block/mtdblock${MTDSYSTEM} /system
+version=NONE
+if [ -f /system/build.prop ]
+then
+	if [ -e /system/framework/semcrilextension.jar ];
+	then
+		version="stock"
+	else
+		version=`grep ro.build.version.release /system/build.prop | awk -F= {'print substr($2,0,3)'}`
+	fi
+fi
+echo "Found android version $version" >> /boot.txt
+mount -t yaffs2 /dev/block/mtdblock${MTDCACHE} /cache
+echo 30 > /sys/class/timed_output/vibrator/enable
+kill -9 $(cat /dev/keycheck.pid)
+if [ -s "/dev/keycheck" -o -e "/cache/recovery/boot" -o ! -f "/android/$version" ]
+then
+	recovery
+else
+	android
+fi
